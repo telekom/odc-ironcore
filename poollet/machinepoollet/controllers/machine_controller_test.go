@@ -764,6 +764,7 @@ var _ = Describe("MachineController", func() {
 		machine.Spec.Volumes = append(machine.Spec.Volumes, computev1alpha1.Volume{
 			Name: "datadisk",
 			VolumeSource: computev1alpha1.VolumeSource{
+				//nolint:staticcheck // Intentionally exercise the deprecated volume source.
 				EmptyDisk: &computev1alpha1.EmptyDiskVolumeSource{
 					SizeLimit: &dataDiskSize,
 				},
@@ -838,6 +839,7 @@ var _ = Describe("MachineController", func() {
 					{
 						Name: "datadisk",
 						VolumeSource: computev1alpha1.VolumeSource{
+							//nolint:staticcheck // Intentionally exercise the deprecated volume source.
 							EmptyDisk: &computev1alpha1.EmptyDiskVolumeSource{
 								SizeLimit: &dataDiskSize,
 							},
