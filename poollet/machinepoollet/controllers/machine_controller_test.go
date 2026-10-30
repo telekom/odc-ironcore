@@ -4,8 +4,10 @@
 package controllers_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	. "github.com/afritzler/protoequal"
@@ -26,6 +28,7 @@ import (
 	. "github.com/onsi/gomega/gstruct"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -716,6 +719,188 @@ var _ = Describe("MachineController", func() {
 		))
 	})
 
+	It("should reject or explain an emptyDisk volume added on update", func(ctx SpecContext) {
+		skipUnlessReproducingEmptyDisk()
+		rootDiskSize := resource.MustParse("1Gi")
+		dataDiskSize := resource.MustParse("128Mi")
+		machine := &computev1alpha1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:    ns.Name,
+				GenerateName: "machine-",
+			},
+			Spec: computev1alpha1.MachineSpec{
+				MachineClassRef: corev1.LocalObjectReference{Name: mc.Name},
+				MachinePoolRef:  &corev1.LocalObjectReference{Name: mp.Name},
+				Volumes: []computev1alpha1.Volume{
+					{
+						Name: "rootdisk",
+						VolumeSource: computev1alpha1.VolumeSource{
+							LocalDisk: &computev1alpha1.LocalDiskVolumeSource{
+								SizeLimit: &rootDiskSize,
+							},
+						},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, machine)).To(Succeed())
+		DeferCleanup(k8sClient.Delete, machine)
+
+		By("waiting for the runtime to report the machine")
+		Eventually(srv).Should(HaveField("Machines", HaveLen(1)))
+		_, iriMachine := GetSingleMapEntry(srv.Machines)
+
+		By("reporting the root disk as attached")
+		iriMachine = &testingmachine.FakeMachine{Machine: proto.Clone(iriMachine.Machine).(*iri.Machine)}
+		iriMachine.Metadata.Generation = 1
+		iriMachine.Status.ObservedGeneration = 1
+		iriMachine.Status.Volumes = []*iri.VolumeStatus{
+			{
+				Name:   "rootdisk",
+				Handle: "rootdisk-handle",
+				State:  iri.VolumeState_VOLUME_ATTACHED,
+			},
+		}
+		srv.SetMachines([]*testingmachine.FakeMachine{iriMachine})
+
+		By("adding a deprecated emptyDisk data volume")
+		base := machine.DeepCopy()
+		machine.Spec.Volumes = append(machine.Spec.Volumes, computev1alpha1.Volume{
+			Name: "datadisk",
+			VolumeSource: computev1alpha1.VolumeSource{
+				//nolint:staticcheck // Intentionally exercise the deprecated volume source.
+				EmptyDisk: &computev1alpha1.EmptyDiskVolumeSource{
+					SizeLimit: &dataDiskSize,
+				},
+			},
+		})
+		err := k8sClient.Patch(ctx, machine, client.MergeFrom(base))
+
+		By("expecting a rejection or a specific explanation")
+		expectEmptyDiskRejectedOrExplained(ctx, err, machine)
+	})
+
+	It("should reject or explain an emptyDisk volume on create", func(ctx SpecContext) {
+		skipUnlessReproducingEmptyDisk()
+		rootDiskSize := resource.MustParse("1Gi")
+		dataDiskSize := resource.MustParse("128Mi")
+		machine := &computev1alpha1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:    ns.Name,
+				GenerateName: "machine-",
+			},
+			Spec: computev1alpha1.MachineSpec{
+				MachineClassRef: corev1.LocalObjectReference{Name: mc.Name},
+				MachinePoolRef:  &corev1.LocalObjectReference{Name: mp.Name},
+				Volumes: []computev1alpha1.Volume{
+					{
+						Name: "rootdisk",
+						VolumeSource: computev1alpha1.VolumeSource{
+							LocalDisk: &computev1alpha1.LocalDiskVolumeSource{
+								SizeLimit: &rootDiskSize,
+							},
+						},
+					},
+					{
+						Name: "datadisk",
+						VolumeSource: computev1alpha1.VolumeSource{
+							//nolint:staticcheck // Intentionally exercise the deprecated volume source.
+							EmptyDisk: &computev1alpha1.EmptyDiskVolumeSource{
+								SizeLimit: &dataDiskSize,
+							},
+						},
+					},
+				},
+			},
+		}
+
+		By("creating a machine with an emptyDisk data volume")
+		err := k8sClient.Create(ctx, machine)
+		if err == nil {
+			DeferCleanup(k8sClient.Delete, machine)
+		}
+
+		By("expecting a rejection or a specific explanation")
+		expectEmptyDiskRejectedOrExplained(ctx, err, machine)
+	})
+
+	It("should attach a localDisk data volume on update", func(ctx SpecContext) {
+		rootDiskSize := resource.MustParse("1Gi")
+		dataDiskSize := resource.MustParse("128Mi")
+		machine := &computev1alpha1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:    ns.Name,
+				GenerateName: "machine-",
+			},
+			Spec: computev1alpha1.MachineSpec{
+				MachineClassRef: corev1.LocalObjectReference{Name: mc.Name},
+				MachinePoolRef:  &corev1.LocalObjectReference{Name: mp.Name},
+				Volumes: []computev1alpha1.Volume{
+					{
+						Name: "rootdisk",
+						VolumeSource: computev1alpha1.VolumeSource{
+							LocalDisk: &computev1alpha1.LocalDiskVolumeSource{
+								SizeLimit: &rootDiskSize,
+							},
+						},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, machine)).To(Succeed())
+		DeferCleanup(k8sClient.Delete, machine)
+
+		By("waiting for the runtime to report the machine")
+		Eventually(srv).Should(HaveField("Machines", HaveLen(1)))
+		_, iriMachine := GetSingleMapEntry(srv.Machines)
+		machineID := iriMachine.Metadata.Id
+
+		By("reporting the root disk as attached")
+		iriMachine = &testingmachine.FakeMachine{Machine: proto.Clone(iriMachine.Machine).(*iri.Machine)}
+		iriMachine.Metadata.Generation = 1
+		iriMachine.Status.ObservedGeneration = 1
+		iriMachine.Status.Volumes = []*iri.VolumeStatus{
+			{
+				Name:   "rootdisk",
+				Handle: "rootdisk-handle",
+				State:  iri.VolumeState_VOLUME_ATTACHED,
+			},
+		}
+		srv.SetMachines([]*testingmachine.FakeMachine{iriMachine})
+
+		By("adding a localDisk data volume")
+		base := machine.DeepCopy()
+		machine.Spec.Volumes = append(machine.Spec.Volumes, computev1alpha1.Volume{
+			Name: "datadisk",
+			VolumeSource: computev1alpha1.VolumeSource{
+				LocalDisk: &computev1alpha1.LocalDiskVolumeSource{
+					SizeLimit: &dataDiskSize,
+				},
+			},
+		})
+		Expect(k8sClient.Patch(ctx, machine, client.MergeFrom(base))).To(Succeed())
+
+		By("verifying the runtime receives exactly one 128 MiB data disk")
+		Eventually(func(g Gomega) {
+			srv.Lock()
+			defer srv.Unlock()
+			g.Expect(srv.Machines).To(HaveLen(1))
+			g.Expect(srv.Machines).To(HaveKey(machineID))
+			g.Expect(srv.Machines[machineID].Spec.Volumes).To(ProtoConsistOf(
+				&iri.Volume{
+					Name:      "rootdisk",
+					Device:    "oda",
+					LocalDisk: &iri.LocalDisk{SizeBytes: rootDiskSize.Value()},
+				},
+				&iri.Volume{
+					Name:      "datadisk",
+					Device:    "odb",
+					LocalDisk: &iri.LocalDisk{SizeBytes: 134217728},
+				},
+			))
+		}).Should(Succeed())
+	})
+
 	It("should validate IRI volume update for machine", func(ctx SpecContext) {
 		const fooAnnotationValue = "bar"
 		By("creating a network")
@@ -1167,6 +1352,33 @@ func mustMarshalJSON(v interface{}) string {
 		panic(err)
 	}
 	return string(data)
+}
+
+// skipUnlessReproducingEmptyDisk keeps the failing emptyDisk reproducers out of
+// regular test runs. Set REPRODUCE_EMPTYDISK=1 to run them.
+func skipUnlessReproducingEmptyDisk() {
+	if os.Getenv("REPRODUCE_EMPTYDISK") == "" {
+		Skip("set REPRODUCE_EMPTYDISK=1 to run the emptyDisk reproducer")
+	}
+}
+
+// expectEmptyDiskRejectedOrExplained passes if the API rejected the request
+// with localDisk guidance, or the Machine reports a condition naming both
+// emptyDisk and localDisk.
+func expectEmptyDiskRejectedOrExplained(ctx context.Context, err error, machine *computev1alpha1.Machine) {
+	GinkgoHelper()
+	if err != nil {
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "unexpected error: %v", err)
+		Expect(err.Error()).To(ContainSubstring("localDisk"))
+		return
+	}
+	Eventually(func(g Gomega) []computev1alpha1.MachineCondition {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(machine), machine)).To(Succeed())
+		return machine.Status.Conditions
+	}).Should(ContainElement(HaveField("Message", SatisfyAll(
+		ContainSubstring("emptyDisk"),
+		ContainSubstring("localDisk"),
+	))), "emptyDisk was accepted, but no condition explains that it is unsupported")
 }
 
 var _ = Describe("ComputeMachineConditions", func() {
